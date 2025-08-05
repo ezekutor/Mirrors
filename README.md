@@ -14,4 +14,4 @@ You are not allowed to:
 
 Commercial use is only permitted with explicit written consent from the author(s).
 
-© [Your Name or Username], [Year]
+© Wirstaff.inc, 2025
