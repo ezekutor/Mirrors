@@ -208,7 +208,7 @@ func (p *Player) SendTickets() {
 	builder.LastRequestSeqFromServer = p.messageSequence
 	p.messageSequenceMutex.Unlock()
 
-	builder.AppIds = []uint32{730}
+	builder.AppIds = []uint32{240}
 	builder.Tickets = p.tickets
 
 	p.ticketsMutex.Unlock()

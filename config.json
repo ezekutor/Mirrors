@@ -1,6 +1,5 @@
 {
   "start_port": 27016,
-  "csgo_mod": false,
   "servers": [
     {
       "count": 1000,

@@ -26,7 +26,6 @@ type Server struct {
 	region     string
 	port       uint32
 	bots       uint8
-	csgoMod    bool
 	tags       string
 
 	appid   uint32
@@ -40,7 +39,7 @@ type Server struct {
 
 func New() *Server {
 	server := &Server{
-		appid:   730,
+		appid:   240,
 		version: "9.99.9.9",
 	}
 
@@ -53,11 +52,10 @@ func (s *Server) Connect() {
 	s.client.Connect()
 }
 
-func (s *Server) Logon(token string) {
+func (s *Server) Logon() {
 	builder := new(protobuf.CMsgClientLogon)
 	builder.ProtocolVersion = proto.Uint32(steamlang.MsgClientLogon_CurrentProtocol)
 	builder.GameServerAppId = proto.Int32(int32(s.appid))
-	builder.GameServerToken = proto.String(token)
 	s.client.SetSessionId(0)
 	s.client.SetSteamId(uint64(steamid.NewIdAdv(0, 0, int32(steamlang.EUniverse_Public), int32(steamlang.EAccountType_GameServer))))
 	s.client.Write(protocol.NewClientMsgProtobuf(steamlang.EMsg_ClientLogonGameServer, builder))
@@ -82,11 +80,7 @@ func (s *Server) sendServerType() {
 	builder.GamePort = proto.Uint32(s.port)
 	builder.GameVersion = proto.String(s.version)
 
-	if s.csgoMod {
-		builder.GameDir = proto.String("csgo")
-	} else {
-		builder.GameDir = proto.String("cs2")
-	}
+	builder.GameDir = proto.String("cstrike")
 
 	s.client.Write(protocol.NewClientMsgProtobuf(steamlang.EMsg_GSServerType, builder))
 }
@@ -106,14 +100,10 @@ func (s *Server) sendServerData() {
 	builder.Dedicated = proto.Bool(true)
 	builder.GameType = proto.String(s.tags)
 
-	if s.csgoMod {
-		builder.Product = proto.String("csgo")
-	} else {
-		builder.Product = proto.String("cs2")
-	}
+	builder.Product = proto.String("css")
 
 	builder.Region = proto.String(s.region)
-	builder.Gamedir = proto.String("csgo")
+	builder.Gamedir = proto.String("cstrike")
 	builder.Os = proto.String("l")
 
 	s.client.Write(protocol.NewClientMsgProtobuf(steamlang.EMsg_AMGameServerUpdate, builder))
@@ -180,10 +170,6 @@ func (s *Server) SetPort(value uint32) {
 
 func (s *Server) SetBots(value uint8) {
 	s.bots = value
-}
-
-func (s *Server) SetCSGOMod(value bool) {
-	s.csgoMod = value
 }
 
 func (s *Server) SetTags(value string) {
