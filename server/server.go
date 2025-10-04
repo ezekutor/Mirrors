@@ -189,3 +189,7 @@ func (s *Server) SetCSGOMod(value bool) {
 func (s *Server) SetTags(value string) {
 	s.tags = value
 }
+
+func (s *Server) SetVersion(value string) {
+	s.version = value
+}

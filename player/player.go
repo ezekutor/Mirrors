@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"google.golang.org/protobuf/proto"
 	"hash/crc32"
-	"io/ioutil"
 	"os"
 	"sync"
 	"time"
@@ -89,7 +88,7 @@ func (p *Player) pullGcToken() []byte {
 func (p *Player) GetAppOwnershipTicket(appId uint32) {
 	cachedTickedFileName := p.generateAppTicketFileCacheName(appId)
 
-	appTicket, err := ioutil.ReadFile(cachedTickedFileName)
+	appTicket, err := os.ReadFile(cachedTickedFileName)
 	if err == nil && len(appTicket) > 0 {
 		parsedTicket, err := appticket.NewAppTicket(appTicket)
 
