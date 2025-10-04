@@ -1,7 +1,7 @@
 package player
 
 import (
-	"io/ioutil"
+	"os"
 	"sync/atomic"
 	"time"
 	"wirstaff.com/mirrors/player/appticket"
@@ -73,7 +73,7 @@ func (p *Player) handleGetAppOwnershipTicketResponse(packet *protocol.Packet) {
 		return
 	}
 
-	ioutil.WriteFile(p.generateAppTicketFileCacheName(body.GetAppId()), body.GetTicket(), 0744)
+	os.WriteFile(p.generateAppTicketFileCacheName(body.GetAppId()), body.GetTicket(), 0o744)
 	ticket, err := appticket.NewAppTicket(body.GetTicket())
 	if err != nil {
 		p.client.Emit(&AppOwnershipTicketResponse{Ticket: nil})

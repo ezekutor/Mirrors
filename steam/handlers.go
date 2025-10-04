@@ -5,7 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"wirstaff.com/mirrors/protocol"
 	"wirstaff.com/mirrors/protocol/protobuf"
 	"wirstaff.com/mirrors/protocol/steamlang"
@@ -74,11 +74,12 @@ func (c *Client) handleMulti(packet *protocol.Packet) {
 			return
 		}
 
-		payload, err = ioutil.ReadAll(r)
+		payload, err = io.ReadAll(r)
 		if err != nil {
 			c.Errorf("handleMulti: Error while decompressing: %v", err)
 			return
 		}
+		r.Close()
 	}
 
 	pr := bytes.NewReader(payload)

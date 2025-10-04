@@ -2,7 +2,6 @@ package utils
 
 import (
 	"bufio"
-	_ "github.com/mattn/go-sqlite3"
 	"log"
 	"os"
 )

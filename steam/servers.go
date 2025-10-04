@@ -7,17 +7,20 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 )
 
 var servers *deque.Deque[string] = nil
 var serversRWMutex sync.RWMutex
 
-func InitServers(err error) {
-	servers = deque.NewDeque[string]()
+var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-	if err == nil {
-		getServers()
+func InitServers() error {
+	servers = deque.NewDeque[string]()
+	if err := getServers(); err != nil {
+		return err
 	}
+	return nil
 }
 
 func GetServer() string {
@@ -55,33 +58,36 @@ func BlockServerAndBackNewServer(server string) string {
 	return GetServer()
 }
 
-func getServers() {
+func getServers() error {
 	for i := 0; i < 15; i++ {
-		client := new(http.Client)
-		resp, err := client.Get(fmt.Sprintf("https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cellId=%d", i))
-
+		resp, err := httpClient.Get(fmt.Sprintf("https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cellId=%d", i))
 		if err != nil {
-			log.Fatalf("[client] Error getting servers")
+			return fmt.Errorf("[client] error getting servers: %w", err)
 		}
 
-		data := Response{}
-
+		var data Response
 		if err = json.NewDecoder(resp.Body).Decode(&data); err != nil {
-			log.Fatalf("[client] Error parse servers")
+			resp.Body.Close()
+			return fmt.Errorf("[client] error parse servers: %w", err)
 		}
-
-		if len(data.Response.ServerList) == 0 {
-			log.Fatalf("[client] Steam returned zero servers")
-		}
+		resp.Body.Close()
 
 		for _, server := range data.Response.ServerList {
-			serversRWMutex.Lock()
-			if server.Type == "websockets" {
-				servers.PushBack(server.EndPoint)
+			if server.Type != "websockets" {
+				continue
 			}
+
+			serversRWMutex.Lock()
+			servers.PushBack(server.EndPoint)
 			serversRWMutex.Unlock()
 		}
 	}
+
+	if servers.IsEmpty() {
+		return fmt.Errorf("[client] Steam returned zero servers")
+	}
+
+	return nil
 }
 
 type Response struct {
