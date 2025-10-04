@@ -26,7 +26,6 @@ type Server struct {
 	region     string
 	port       uint32
 	bots       uint8
-	csgoMod    bool
 	tags       string
 
 	appid   uint32
@@ -82,11 +81,7 @@ func (s *Server) sendServerType() {
 	builder.GamePort = proto.Uint32(s.port)
 	builder.GameVersion = proto.String(s.version)
 
-	if s.csgoMod {
-		builder.GameDir = proto.String("csgo")
-	} else {
-		builder.GameDir = proto.String("cs2")
-	}
+	builder.GameDir = proto.String("cs2")
 
 	s.client.Write(protocol.NewClientMsgProtobuf(steamlang.EMsg_GSServerType, builder))
 }
@@ -106,14 +101,10 @@ func (s *Server) sendServerData() {
 	builder.Dedicated = proto.Bool(true)
 	builder.GameType = proto.String(s.tags)
 
-	if s.csgoMod {
-		builder.Product = proto.String("csgo")
-	} else {
-		builder.Product = proto.String("cs2")
-	}
+	builder.Product = proto.String("cs2")
 
 	builder.Region = proto.String(s.region)
-	builder.Gamedir = proto.String("csgo")
+	builder.Gamedir = proto.String("cs2")
 	builder.Os = proto.String("l")
 
 	s.client.Write(protocol.NewClientMsgProtobuf(steamlang.EMsg_AMGameServerUpdate, builder))
@@ -180,10 +171,6 @@ func (s *Server) SetPort(value uint32) {
 
 func (s *Server) SetBots(value uint8) {
 	s.bots = value
-}
-
-func (s *Server) SetCSGOMod(value bool) {
-	s.csgoMod = value
 }
 
 func (s *Server) SetTags(value string) {

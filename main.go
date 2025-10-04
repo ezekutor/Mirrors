@@ -25,7 +25,6 @@ import (
 type Config struct {
 	StartPort uint32    `json:"start_port"`
 	Servers   []Servers `json:"servers"`
-	CSGOMod   bool      `json:"csgo_mod"`
 }
 
 type Servers struct {
@@ -40,7 +39,6 @@ type Servers struct {
 	Secure        bool   `json:"secure"`
 	Tags          string `json:"tags"`
 	Description   string `json:"description"`
-	UseAbuse      bool   `json:"use_abuse"`
 }
 
 const (
@@ -211,7 +209,7 @@ func startMirrors(cfg *Config) {
 	}
 }
 
-func runMirror(item Servers, token string, port uint32, csgoMod bool) {
+func runMirror(item Servers, token string, port uint32) {
 	s := server.New()
 	s.SetHostname(item.Hostname)
 	s.SetMap(item.Map)
@@ -220,7 +218,6 @@ func runMirror(item Servers, token string, port uint32, csgoMod bool) {
 	s.SetSecure(item.Secure)
 	s.SetRegion(item.Region)
 	s.SetBots(item.Bots)
-	s.SetCSGOMod(csgoMod)
 	s.SetTags(item.Tags)
 	s.SetVersion(getGameVersion())
 	s.Connect()
