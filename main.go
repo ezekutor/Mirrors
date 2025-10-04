@@ -1,15 +1,16 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"wirstaff.com/mirrors/player"
 	"wirstaff.com/mirrors/server"
@@ -99,7 +100,10 @@ func main() {
 
 	go loadServers(config)
 
-	background()
+	quit := background()
+	sig := <-quit
+	log.Printf("Получен сигнал завершения: %s", sig)
+	signal.Stop(quit)
 }
 
 func loadServers(config *Config) {
@@ -352,16 +356,8 @@ func heartbeatLoop() {
 	}
 }
 
-func background() {
-	fmt.Println("Нажми 'q' + 'Enter' чтобы закрыть программу")
-
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		exit := scanner.Text()
-		if exit == "q" {
-			break
-		} else {
-			fmt.Println("Нажми 'q' + 'Enter' чтобы закрыть программу")
-		}
-	}
+func background() chan os.Signal {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	return quit
 }
