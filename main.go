@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -11,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,10 +44,9 @@ type Servers struct {
 }
 
 const (
-	defaultConfigPath  = "config.json"
-	defaultAccounts    = "accounts.txt"
-	defaultTokens      = "tokens.txt"
-	defaultVersionFile = "version.txt"
+	defaultConfigPath = "config.json"
+	defaultAccounts   = "accounts.txt"
+	defaultTokens     = "tokens.txt"
 )
 
 var (
@@ -71,6 +70,8 @@ var (
 	httpClient = &http.Client{Timeout: 10 * time.Second}
 )
 
+var steamVersionHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 func main() {
 	log.Println("Product ID: mirrors-x-cs2go")
 	log.Println("Product Version: 0.1.0-beta")
@@ -86,7 +87,6 @@ func main() {
 	configPath := flag.String("config", defaultConfigPath, "Путь до файла с конфигом")
 	accountsPath := flag.String("accounts", defaultAccounts, "Путь до файла с аккаунтами")
 	tokensPath := flag.String("tokens", defaultTokens, "Путь до файла с токенами")
-	versionPath := flag.String("version", defaultVersionFile, "Путь до файла с версией игры")
 	flag.Parse()
 
 	config, err := loadConfig(*configPath)
@@ -103,11 +103,13 @@ func main() {
 
 	version, err := loadVersion(*versionPath)
 	if err != nil {
-		log.Fatalf("Не удалось загрузить версию игры: %v", err)
+		log.Fatalf("Не удалось получить версию игры: %v", err)
 	}
-	setGameVersion(version)
+	if err := setGameVersion(version); err != nil {
+		log.Fatalf("Не удалось сохранить версию игры: %v", err)
+	}
 
-	go autoUpdate(*versionPath)
+	go autoUpdate()
 	go heartbeatLoop()
 	go startMirrors(config)
 
@@ -131,37 +133,35 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func loadVersion(path string) (string, error) {
-	if data, err := os.ReadFile(path); err == nil {
-		version := strings.TrimSpace(string(data))
-		if version != "" {
-			log.Printf("[INFO] Cached version %s", version)
-			return version, nil
-		}
+func setGameVersion(version string) error {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return fmt.Errorf("пустая версия игры")
 	}
 
-	log.Println("[INFO] Fetching game version…")
-	version, err := fetchSteamVersion()
-	if err != nil {
-		return "", err
+	gameVersionLock.Lock()
+	if gameVersion == version {
+		gameVersionLock.Unlock()
+		return nil
 	}
-
-	if err := saveVersion(path, version); err != nil {
-		return "", err
-	}
+	gameVersion = version
+	gameVersionLock.Unlock()
 
 	return version, nil
 }
 
 func fetchSteamVersion() (string, error) {
-	resp, err := httpClient.Get("https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/?appid=730&version=0")
+	const url = "https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/?appid=730&version=0"
+
+	resp, err := steamVersionHTTPClient.Get(url)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("не удалось выполнить запрос к Steam: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("steam api returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("steam api вернул статус %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var payload struct {
@@ -222,6 +222,7 @@ func runMirror(item Servers, token string, port uint32, csgoMod bool) {
 	s.SetBots(item.Bots)
 	s.SetCSGOMod(csgoMod)
 	s.SetTags(item.Tags)
+	s.SetVersion(getGameVersion())
 	s.Connect()
 
 	started := false
