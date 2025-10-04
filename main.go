@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,8 +10,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"wirstaff.com/mirrors/player"
@@ -56,14 +57,17 @@ var (
 	playersMutex sync.RWMutex
 	players      []*player.Player
 
-	accounts []string
-	tokens   []string
+var playersForServerMutex sync.RWMutex
+var playersForServer = make(map[*server.Server][]*player.Player)
 
-	gameVersion      string
-	gameVersionMutex sync.RWMutex
-)
+var playerAccountsMutex sync.Mutex
+var playerAccounts = make(map[*player.Player]string)
 
-var httpClient = &http.Client{Timeout: 10 * time.Second}
+var accounts []string
+var tokens []string
+
+var accountsMutex sync.Mutex
+var accountsQueue []string
 
 func main() {
 	log.Println("Product ID: mirrors-x-cs2go")
@@ -137,13 +141,19 @@ func loadVersion(path string) (string, error) {
 		return "", err
 	}
 
-	log.Printf("[INFO] Game version %s", version)
+	accountsMutex.Lock()
+	accountsQueue = append(accountsQueue, accounts...)
+	accountsMutex.Unlock()
+
+	go heartbeatLoop()
 
 	return version, nil
 }
 
-func saveVersion(path, version string) error {
-	return os.WriteFile(path, []byte(version), 0o644)
+	quit := background()
+	sig := <-quit
+	log.Printf("Получен сигнал завершения: %s", sig)
+	signal.Stop(quit)
 }
 
 func fetchSteamVersion() (string, error) {
@@ -157,112 +167,225 @@ func fetchSteamVersion() (string, error) {
 		return "", fmt.Errorf("steam api returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
+	tokensCount := 0
+	var tokensMutex sync.Mutex
 
-	var payload struct {
-		Response struct {
-			RequiredVersion int `json:"required_version"`
-		} `json:"response"`
-	}
-
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", err
-	}
-
-	if payload.Response.RequiredVersion == 0 {
-		return "", errors.New("steam api returned empty version")
-	}
-
-	return formatVersion(payload.Response.RequiredVersion), nil
-}
-
-func formatVersion(raw int) string {
-	major := raw / 10000
-	minor := (raw / 100) % 100
-	build := (raw / 10) % 10
-	patch := raw % 10
-	return fmt.Sprintf("%d.%02d.%d.%d", major, minor, build, patch)
-}
-
-func setGameVersion(version string) {
-	gameVersionMutex.Lock()
-	gameVersion = version
-	gameVersionMutex.Unlock()
-}
-
-func getGameVersion() string {
-	gameVersionMutex.RLock()
-	defer gameVersionMutex.RUnlock()
-	return gameVersion
-}
-
-func autoUpdate(versionPath string) {
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		version := getGameVersion()
-		fresh, err := fetchSteamVersion()
-		if err != nil {
-			log.Printf("[WARN] version check failed: %v", err)
-			continue
-		}
-
-		if fresh != version {
-			log.Printf("[INFO] New CS2 version %s (was %s)", fresh, version)
-			setGameVersion(fresh)
-			if err := saveVersion(versionPath, fresh); err != nil {
-				log.Printf("[WARN] failed to save version: %v", err)
-			}
-		}
-	}
-}
-
-func startMirrors(config *Config) {
-	var (
-		startPort     = config.StartPort
-		portMutex     sync.Mutex
-		tokensIndex   int
-		tokensMutex   sync.Mutex
-		accountsIdx   int
-		accountsMutex sync.Mutex
-	)
-
-	for _, tmpl := range config.Servers {
-		tmpl := tmpl
-		log.Printf("[INFO] Template \"%s\" ×%d", tmpl.Hostname, tmpl.Count)
-		for i := uint32(0); i < tmpl.Count; i++ {
+	for _, item := range config.Servers {
+		item := item
+		for range item.Count {
 			tokensMutex.Lock()
-			if tokensIndex >= len(tokens) {
+			if tokensCount >= len(tokens)-1 {
 				tokensMutex.Unlock()
-				log.Println("[WARN] tokens.txt exhausted")
-				return
-			}
-
-			token := strings.TrimSpace(tokens[tokensIndex])
-			tokensIndex++
-			tokensMutex.Unlock()
-
-			if token == "" {
-				log.Println("[WARN] пустой токен, зеркало пропущено")
 				continue
 			}
+			token := tokens[tokensCount]
+			tokensCount++
+			tokensMutex.Unlock()
 
 			portMutex.Lock()
 			port := startPort
 			startPort++
 			portMutex.Unlock()
 
-			if err := startUDPServer(port, tmpl); err != nil {
-				log.Printf("[WARN] не удалось запустить UDP сервер на порту %d: %v", port, err)
+			go runMirror(item, token, port, config.CSGOMod)
+		}
+	}
+}
+
+func runMirror(item Servers, token string, port uint32, csgoMod bool) {
+	s := server.New()
+	s.SetHostname(item.Hostname)
+	s.SetMap(item.Map)
+	s.SetMaxPlayers(item.MaxPlayers)
+	s.SetPort(port)
+	s.SetSecure(item.Secure)
+	s.SetRegion(item.Region)
+	s.SetBots(item.Bots)
+	s.SetCSGOMod(csgoMod)
+	s.SetTags(item.Tags)
+	s.Connect()
+
+	started := false
+
+	for event := range s.Events() {
+		switch e := event.(type) {
+		case *steam.ConnectedEvent:
+			s.Logon(token)
+			continue
+		case *server.LoggedOnEvent:
+			if e.Result == 1 {
+				log.Printf("Зеркало %s запущено на порту %d\n", item.Hostname, port)
+				mirrorsMutex.Lock()
+				mirrors = append(mirrors, s)
+				mirrorsMutex.Unlock()
+				started = true
+			}
+		case steam.FatalErrorEvent:
+		case error:
+		}
+
+		break
+	}
+
+	if !started {
+		return
+	}
+
+	playersList := startPlayersForServer(s, item)
+
+	playersForServerMutex.Lock()
+	playersForServer[s] = append([]*player.Player(nil), playersList...)
+	playersForServerMutex.Unlock()
+
+	fmt.Println("Send Tickets")
+	s.SendTickets()
+
+	ticker := time.NewTicker(6 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		playersForServerMutex.Lock()
+		currentPlayers := playersForServer[s]
+		delete(playersForServer, s)
+		playersForServerMutex.Unlock()
+
+		for _, p := range currentPlayers {
+			cleanupPlayer(p)
+		}
+
+		newPlayers := startPlayersForServer(s, item)
+
+		playersForServerMutex.Lock()
+		playersForServer[s] = append([]*player.Player(nil), newPlayers...)
+		playersForServerMutex.Unlock()
+
+		s.SendTickets()
+	}
+}
+
+func startPlayersForServer(s *server.Server, item Servers) []*player.Player {
+	startedPlayers := make([]*player.Player, 0, item.Players)
+
+	for i := uint8(0); i < item.Players; i++ {
+		account, ok := acquireAccount()
+		if !ok {
+			break
+		}
+
+		credentials := strings.SplitN(account, ":", 2)
+		if len(credentials) != 2 {
+			releaseAccount(account)
+			continue
+		}
+
+		p := player.New()
+		loggedOn := false
+
+		for event := range p.Events() {
+			switch e := event.(type) {
+			case *steam.ConnectedEvent:
+				p.Logon(credentials[0], credentials[1])
+				continue
+			case *player.LoggedOnEvent:
+				if e.Result == 1 {
+					log.Printf("Аккаунт %s авторизован\n", credentials[0])
+					playersMutex.Lock()
+					players = append(players, p)
+					playersMutex.Unlock()
+
+					playerAccountsMutex.Lock()
+					playerAccounts[p] = account
+					playerAccountsMutex.Unlock()
+
+					startedPlayers = append(startedPlayers, p)
+					loggedOn = true
+
+					p.GetAppOwnershipTicket(730)
+					continue
+				}
+			case *player.AppOwnershipTicketResponse:
+				ticket := e.Ticket
+				if ticket != nil {
+					if result, err := p.AuthSessionTicket(e.Ticket); err == nil {
+						s.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
+					}
+				}
+			case steam.FatalErrorEvent:
+			case error:
 			}
 
-			go runMirror(tmpl, token, port, config.CSGOMod, &accountsMutex, &accountsIdx)
+			break
+		}
 
-			time.Sleep(250 * time.Millisecond)
+		if !loggedOn {
+			p.Logoff()
+			releaseAccount(account)
+			continue
+		}
+
+		if item.Bots > 0 || item.UseAbuse {
+			break
+		}
+	}
+
+	return startedPlayers
+}
+
+func acquireAccount() (string, bool) {
+	accountsMutex.Lock()
+	defer accountsMutex.Unlock()
+
+	if len(accountsQueue) == 0 {
+		return "", false
+	}
+
+	account := accountsQueue[0]
+	accountsQueue = accountsQueue[1:]
+
+	return account, true
+}
+
+func releaseAccount(account string) {
+	if account == "" {
+		return
+	}
+
+	accountsMutex.Lock()
+	accountsQueue = append(accountsQueue, account)
+	accountsMutex.Unlock()
+}
+
+func cleanupPlayer(p *player.Player) {
+	if p == nil {
+		return
+	}
+
+	p.Logoff()
+	releaseAccountForPlayer(p)
+	removePlayer(p)
+}
+
+func releaseAccountForPlayer(p *player.Player) {
+	playerAccountsMutex.Lock()
+	account, ok := playerAccounts[p]
+	if ok {
+		delete(playerAccounts, p)
+	}
+	playerAccountsMutex.Unlock()
+
+	if ok {
+		releaseAccount(account)
+	}
+}
+
+func removePlayer(target *player.Player) {
+	playersMutex.Lock()
+	defer playersMutex.Unlock()
+
+	for i, p := range players {
+		if p == target {
+			players = append(players[:i], players[i+1:]...)
+			break
 		}
 	}
 }
@@ -547,15 +670,8 @@ func boolToByte(v bool) byte {
 	return 0
 }
 
-func background() {
-	fmt.Println("Нажми 'q' + 'Enter' чтобы закрыть программу")
-
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		exit := scanner.Text()
-		if exit == "q" {
-			break
-		}
-		fmt.Println("Нажми 'q' + 'Enter' чтобы закрыть программу")
-	}
+func background() chan os.Signal {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	return quit
 }
