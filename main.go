@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -56,21 +56,19 @@ var (
 	playersMutex sync.RWMutex
 	players      []*player.Player
 
-	gameVersion     string
-	gameVersionLock sync.RWMutex
+	playersForServerMutex sync.RWMutex
+	playersForServer      = make(map[*server.Server][]*player.Player)
+
+	playerAccountsMutex sync.Mutex
+	playerAccounts      = make(map[*player.Player]string)
+
+	accounts      []string
+	tokens        []string
+	accountsMutex sync.Mutex
+	accountsQueue []string
+
+	httpClient = &http.Client{Timeout: 10 * time.Second}
 )
-
-var playersForServerMutex sync.RWMutex
-var playersForServer = make(map[*server.Server][]*player.Player)
-
-var playerAccountsMutex sync.Mutex
-var playerAccounts = make(map[*player.Player]string)
-
-var accounts []string
-var tokens []string
-
-var accountsMutex sync.Mutex
-var accountsQueue []string
 
 var steamVersionHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
@@ -103,7 +101,7 @@ func main() {
 	accountsQueue = append(accountsQueue, accounts...)
 	accountsMutex.Unlock()
 
-	version, err := fetchSteamVersion()
+	version, err := loadVersion(*versionPath)
 	if err != nil {
 		log.Fatalf("Не удалось получить версию игры: %v", err)
 	}
@@ -149,21 +147,7 @@ func setGameVersion(version string) error {
 	gameVersion = version
 	gameVersionLock.Unlock()
 
-	log.Printf("[INFO] Актуальная версия игры: %s", version)
-
-	mirrorsMutex.RLock()
-	for _, srv := range mirrors {
-		srv.SetVersion(version)
-	}
-	mirrorsMutex.RUnlock()
-
-	return nil
-}
-
-func getGameVersion() string {
-	gameVersionLock.RLock()
-	defer gameVersionLock.RUnlock()
-	return gameVersion
+	return version, nil
 }
 
 func fetchSteamVersion() (string, error) {
@@ -182,94 +166,47 @@ func fetchSteamVersion() (string, error) {
 
 	var payload struct {
 		Response struct {
-			Success         bool   `json:"success"`
-			RequiredVersion int    `json:"required_version"`
-			Message         string `json:"message"`
+			RequiredVersion string `json:"required_version"`
 		} `json:"response"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", fmt.Errorf("не удалось прочитать ответ Steam: %w", err)
+		return "", err
 	}
 
-	if !payload.Response.Success {
-		msg := strings.TrimSpace(payload.Response.Message)
-		if msg == "" {
-			msg = "steam api вернул неуспешный результат"
-		}
-		return "", fmt.Errorf(msg)
+	version := strings.TrimSpace(payload.Response.RequiredVersion)
+	if version == "" {
+		return "", errors.New("steam returned empty version")
 	}
 
-	if payload.Response.RequiredVersion == 0 {
-		return "", fmt.Errorf("steam api не вернул требуемую версию")
-	}
-
-	return strconv.Itoa(payload.Response.RequiredVersion), nil
-}
-
-func autoUpdate() {
-	ticker := time.NewTicker(20 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		version, err := fetchSteamVersion()
-		if err != nil {
-			log.Printf("[WARN] Не удалось обновить версию игры: %v", err)
-			continue
-		}
-
-		if version == getGameVersion() {
-			continue
-		}
-
-		if err := setGameVersion(version); err != nil {
-			log.Printf("[WARN] Не удалось применить новую версию игры: %v", err)
-		}
-	}
+	return version, nil
 }
 
 func startMirrors(cfg *Config) {
 	if cfg == nil {
-		log.Println("[WARN] Конфигурация зеркал не задана")
 		return
 	}
 
-	var (
-		portMutex   sync.Mutex
-		nextPort    = cfg.StartPort
-		tokensMutex sync.Mutex
-		tokenIndex  int
-	)
+	rand.Seed(time.Now().UnixNano())
 
-	for _, tmpl := range cfg.Servers {
-		tmpl := tmpl
-		for i := uint32(0); i < tmpl.Count; i++ {
-			tokensMutex.Lock()
+	nextPort := cfg.StartPort
+	tokenIndex := 0
+
+	for _, srv := range cfg.Servers {
+		srv := srv
+		for i := uint32(0); i < srv.Count; i++ {
 			if tokenIndex >= len(tokens) {
-				tokensMutex.Unlock()
 				log.Println("[WARN] tokens.txt exhausted")
 				return
 			}
 
 			token := strings.TrimSpace(tokens[tokenIndex])
 			tokenIndex++
-			tokensMutex.Unlock()
 
-			if token == "" {
-				log.Println("[WARN] пустой токен авторизации, зеркало пропущено")
-				continue
-			}
+			go runMirror(srv, token, nextPort, cfg.CSGOMod)
 
-			portMutex.Lock()
-			port := nextPort
 			nextPort++
-			portMutex.Unlock()
-
-			if err := startUDPServer(port, tmpl); err != nil {
-				log.Printf("[WARN] Не удалось запустить UDP сервер на порту %d: %v", port, err)
-			}
-
-			go runMirror(tmpl, token, port, cfg.CSGOMod)
+			time.Sleep(time.Duration(rand.Intn(90)+10) * time.Microsecond)
 		}
 	}
 }
@@ -346,6 +283,11 @@ func runMirror(item Servers, token string, port uint32, csgoMod bool) {
 	}
 }
 
+type playerLoginConfirmation struct {
+	player  *player.Player
+	success bool
+}
+
 func startPlayersForServer(s *server.Server, item Servers) []*player.Player {
 	startedPlayers := make([]*player.Player, 0, item.Players)
 
@@ -361,57 +303,92 @@ func startPlayersForServer(s *server.Server, item Servers) []*player.Player {
 			continue
 		}
 
-		p := player.New()
-		loggedOn := false
-
-		for event := range p.Events() {
-			switch e := event.(type) {
-			case *steam.ConnectedEvent:
-				p.Logon(credentials[0], credentials[1])
-				continue
-			case *player.LoggedOnEvent:
-				if e.Result == 1 {
-					log.Printf("Аккаунт %s авторизован\n", credentials[0])
-					playersMutex.Lock()
-					players = append(players, p)
-					playersMutex.Unlock()
-
-					playerAccountsMutex.Lock()
-					playerAccounts[p] = account
-					playerAccountsMutex.Unlock()
-
-					startedPlayers = append(startedPlayers, p)
-					loggedOn = true
-
-					p.GetAppOwnershipTicket(730)
-					continue
-				}
-			case *player.AppOwnershipTicketResponse:
-				ticket := e.Ticket
-				if ticket != nil {
-					if result, err := p.AuthSessionTicket(e.Ticket); err == nil {
-						s.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
-					}
-				}
-			case steam.FatalErrorEvent:
-			case error:
-			}
-
-			break
-		}
-
-		if !loggedOn {
-			p.Logoff()
+		login := strings.TrimSpace(credentials[0])
+		password := strings.TrimSpace(credentials[1])
+		if login == "" || password == "" {
 			releaseAccount(account)
 			continue
 		}
 
+		confirmation := make(chan playerLoginConfirmation, 1)
+		startPlayer(s, login, password, confirmation)
+
+		result := <-confirmation
+		if !result.success || result.player == nil {
+			if result.player != nil {
+				result.player.Logoff()
+			}
+			releaseAccount(account)
+			continue
+		}
+
+		playersMutex.Lock()
+		players = append(players, result.player)
+		playersMutex.Unlock()
+
+		playerAccountsMutex.Lock()
+		playerAccounts[result.player] = account
+		playerAccountsMutex.Unlock()
+
+		startedPlayers = append(startedPlayers, result.player)
+
 		if item.Bots > 0 || item.UseAbuse {
 			break
 		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	return startedPlayers
+}
+
+func startPlayer(s *server.Server, login, password string, confirmation chan<- playerLoginConfirmation) {
+	p := player.New()
+
+	go func() {
+		confirmed := false
+		defer func() {
+			if !confirmed {
+				confirmation <- playerLoginConfirmation{player: p, success: false}
+			}
+		}()
+
+		for event := range p.Events() {
+			switch e := event.(type) {
+			case *steam.ConnectedEvent:
+				p.Logon(login, password)
+			case *player.LoggedOnEvent:
+				if e.Result == 1 {
+					log.Printf("Аккаунт %s авторизован", login)
+					if !confirmed {
+						confirmation <- playerLoginConfirmation{player: p, success: true}
+						confirmed = true
+					}
+					p.GetAppOwnershipTicket(730)
+				} else {
+					log.Printf("Не удалось авторизовать аккаунт %s. Код: %d", login, e.Result)
+					return
+				}
+			case *player.AppOwnershipTicketResponse:
+				ticket := e.Ticket
+				if ticket != nil {
+					if result, err := p.AuthSessionTicket(ticket); err == nil {
+						s.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
+					} else {
+						log.Printf("[Player] ошибка AuthSessionTicket %s: %v", login, err)
+					}
+				}
+			case steam.FatalErrorEvent:
+				log.Printf("[Player] %s завершился с ошибкой: %v", login, e)
+				return
+			case error:
+				log.Printf("[Player] %s ошибка: %v", login, e)
+				if !confirmed {
+					return
+				}
+			}
+		}
+	}()
 }
 
 func acquireAccount() (string, bool) {
