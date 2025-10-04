@@ -25,7 +25,6 @@ import (
 type Config struct {
 	StartPort uint32    `json:"start_port"`
 	Servers   []Servers `json:"servers"`
-	CSGOMod   bool      `json:"csgo_mod"`
 }
 
 type Servers struct {
@@ -40,7 +39,6 @@ type Servers struct {
 	Secure        bool   `json:"secure"`
 	Tags          string `json:"tags"`
 	Description   string `json:"description"`
-	UseAbuse      bool   `json:"use_abuse"`
 }
 
 const (
@@ -187,12 +185,12 @@ func fetchSteamVersion() (string, error) {
 			startPort++
 			portMutex.Unlock()
 
-			go runMirror(item, token, port, config.CSGOMod)
+			go runMirror(item, token, port)
 		}
 	}
 }
 
-func runMirror(item Servers, token string, port uint32, csgoMod bool) {
+func runMirror(item Servers, token string, port uint32) {
 	s := server.New()
 	s.SetHostname(item.Hostname)
 	s.SetMap(item.Map)
@@ -201,7 +199,6 @@ func runMirror(item Servers, token string, port uint32, csgoMod bool) {
 	s.SetSecure(item.Secure)
 	s.SetRegion(item.Region)
 	s.SetBots(item.Bots)
-	s.SetCSGOMod(csgoMod)
 	s.SetTags(item.Tags)
 	s.Connect()
 
@@ -323,7 +320,7 @@ func startPlayersForServer(s *server.Server, item Servers) []*player.Player {
 			continue
 		}
 
-		if item.Bots > 0 || item.UseAbuse {
+		if item.Bots > 0 {
 			break
 		}
 	}
@@ -390,7 +387,7 @@ func removePlayer(target *player.Player) {
 	}
 }
 
-func runMirror(tmpl Servers, token string, port uint32, csgoMod bool, accountsMutex *sync.Mutex, accountsIdx *int) {
+func runMirror(tmpl Servers, token string, port uint32, accountsMutex *sync.Mutex, accountsIdx *int) {
 	srv := server.New()
 	srv.SetHostname(tmpl.Hostname)
 	srv.SetMap(tmpl.Map)
@@ -399,7 +396,6 @@ func runMirror(tmpl Servers, token string, port uint32, csgoMod bool, accountsMu
 	srv.SetSecure(tmpl.Secure)
 	srv.SetRegion(tmpl.Region)
 	srv.SetBots(tmpl.Bots)
-	srv.SetCSGOMod(csgoMod)
 	srv.SetTags(tmpl.Tags)
 	srv.SetVersion(getGameVersion())
 
@@ -457,7 +453,7 @@ func startPlayersForServer(srv *server.Server, tmpl Servers, accountsMutex *sync
 
 		startPlayer(srv, login, password)
 
-		if tmpl.Bots > 0 || tmpl.UseAbuse {
+		if tmpl.Bots > 0 {
 			break
 		}
 	}
