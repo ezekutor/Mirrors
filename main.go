@@ -57,17 +57,18 @@ var (
 	playersMutex sync.RWMutex
 	players      []*player.Player
 
-var playersForServerMutex sync.RWMutex
-var playersForServer = make(map[*server.Server][]*player.Player)
+	playersForServerMutex sync.RWMutex
+	playersForServer      = make(map[*server.Server][]*player.Player)
 
-var playerAccountsMutex sync.Mutex
-var playerAccounts = make(map[*player.Player]string)
+	playerAccountsMutex sync.Mutex
+	playerAccounts      = make(map[*player.Player]string)
 
-var accounts []string
-var tokens []string
+	accounts []string
+	tokens   []string
 
-var accountsMutex sync.Mutex
-var accountsQueue []string
+	accountsMutex sync.Mutex
+	accountsQueue []string
+)
 
 func main() {
 	log.Println("Product ID: mirrors-x-cs2go")
@@ -105,7 +106,11 @@ func main() {
 	go heartbeatLoop()
 	go startMirrors(config)
 
-	background()
+	quit := background()
+	sig := <-quit
+	log.Printf("Получен сигнал завершения: %s", sig)
+	signal.Stop(quit)
+	log.Println("Завершение работы приложения")
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -148,12 +153,6 @@ func loadVersion(path string) (string, error) {
 	go heartbeatLoop()
 
 	return version, nil
-}
-
-	quit := background()
-	sig := <-quit
-	log.Printf("Получен сигнал завершения: %s", sig)
-	signal.Stop(quit)
 }
 
 func fetchSteamVersion() (string, error) {
