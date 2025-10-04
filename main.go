@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,10 +44,9 @@ type Servers struct {
 }
 
 const (
-	defaultConfigPath  = "config.json"
-	defaultAccounts    = "accounts.txt"
-	defaultTokens      = "tokens.txt"
-	defaultVersionFile = "version.txt"
+	defaultConfigPath = "config.json"
+	defaultAccounts   = "accounts.txt"
+	defaultTokens     = "tokens.txt"
 )
 
 var (
@@ -56,6 +55,10 @@ var (
 
 	playersMutex sync.RWMutex
 	players      []*player.Player
+
+	gameVersion     string
+	gameVersionLock sync.RWMutex
+)
 
 var playersForServerMutex sync.RWMutex
 var playersForServer = make(map[*server.Server][]*player.Player)
@@ -68,6 +71,8 @@ var tokens []string
 
 var accountsMutex sync.Mutex
 var accountsQueue []string
+
+var steamVersionHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 func main() {
 	log.Println("Product ID: mirrors-x-cs2go")
@@ -84,7 +89,6 @@ func main() {
 	configPath := flag.String("config", defaultConfigPath, "Путь до файла с конфигом")
 	accountsPath := flag.String("accounts", defaultAccounts, "Путь до файла с аккаунтами")
 	tokensPath := flag.String("tokens", defaultTokens, "Путь до файла с токенами")
-	versionPath := flag.String("version", defaultVersionFile, "Путь до файла с версией игры")
 	flag.Parse()
 
 	config, err := loadConfig(*configPath)
@@ -95,17 +99,26 @@ func main() {
 	accounts = utils.ReadFile(*accountsPath)
 	tokens = utils.ReadFile(*tokensPath)
 
-	version, err := loadVersion(*versionPath)
-	if err != nil {
-		log.Fatalf("Не удалось загрузить версию игры: %v", err)
-	}
-	setGameVersion(version)
+	accountsMutex.Lock()
+	accountsQueue = append(accountsQueue, accounts...)
+	accountsMutex.Unlock()
 
-	go autoUpdate(*versionPath)
+	version, err := fetchSteamVersion()
+	if err != nil {
+		log.Fatalf("Не удалось получить версию игры: %v", err)
+	}
+	if err := setGameVersion(version); err != nil {
+		log.Fatalf("Не удалось сохранить версию игры: %v", err)
+	}
+
+	go autoUpdate()
 	go heartbeatLoop()
 	go startMirrors(config)
 
-	background()
+	quit := background()
+	sig := <-quit
+	log.Printf("Получен сигнал завершения: %s", sig)
+	signal.Stop(quit)
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -122,72 +135,141 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func loadVersion(path string) (string, error) {
-	if data, err := os.ReadFile(path); err == nil {
-		version := strings.TrimSpace(string(data))
-		if version != "" {
-			log.Printf("[INFO] Cached version %s", version)
-			return version, nil
-		}
+func setGameVersion(version string) error {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return fmt.Errorf("пустая версия игры")
 	}
 
-	log.Println("[INFO] Fetching game version…")
-	version, err := fetchSteamVersion()
-	if err != nil {
-		return "", err
+	gameVersionLock.Lock()
+	if gameVersion == version {
+		gameVersionLock.Unlock()
+		return nil
 	}
+	gameVersion = version
+	gameVersionLock.Unlock()
 
-	if err := saveVersion(path, version); err != nil {
-		return "", err
+	log.Printf("[INFO] Актуальная версия игры: %s", version)
+
+	mirrorsMutex.RLock()
+	for _, srv := range mirrors {
+		srv.SetVersion(version)
 	}
+	mirrorsMutex.RUnlock()
 
-	accountsMutex.Lock()
-	accountsQueue = append(accountsQueue, accounts...)
-	accountsMutex.Unlock()
-
-	go heartbeatLoop()
-
-	return version, nil
+	return nil
 }
 
-	quit := background()
-	sig := <-quit
-	log.Printf("Получен сигнал завершения: %s", sig)
-	signal.Stop(quit)
+func getGameVersion() string {
+	gameVersionLock.RLock()
+	defer gameVersionLock.RUnlock()
+	return gameVersion
 }
 
 func fetchSteamVersion() (string, error) {
-	resp, err := httpClient.Get("https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/?appid=730&version=0")
+	const url = "https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/?appid=730&version=0"
+
+	resp, err := steamVersionHTTPClient.Get(url)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("не удалось выполнить запрос к Steam: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("steam api returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("steam api вернул статус %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	tokensCount := 0
-	var tokensMutex sync.Mutex
+	var payload struct {
+		Response struct {
+			Success         bool   `json:"success"`
+			RequiredVersion int    `json:"required_version"`
+			Message         string `json:"message"`
+		} `json:"response"`
+	}
 
-	for _, item := range config.Servers {
-		item := item
-		for range item.Count {
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("не удалось прочитать ответ Steam: %w", err)
+	}
+
+	if !payload.Response.Success {
+		msg := strings.TrimSpace(payload.Response.Message)
+		if msg == "" {
+			msg = "steam api вернул неуспешный результат"
+		}
+		return "", fmt.Errorf(msg)
+	}
+
+	if payload.Response.RequiredVersion == 0 {
+		return "", fmt.Errorf("steam api не вернул требуемую версию")
+	}
+
+	return strconv.Itoa(payload.Response.RequiredVersion), nil
+}
+
+func autoUpdate() {
+	ticker := time.NewTicker(20 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		version, err := fetchSteamVersion()
+		if err != nil {
+			log.Printf("[WARN] Не удалось обновить версию игры: %v", err)
+			continue
+		}
+
+		if version == getGameVersion() {
+			continue
+		}
+
+		if err := setGameVersion(version); err != nil {
+			log.Printf("[WARN] Не удалось применить новую версию игры: %v", err)
+		}
+	}
+}
+
+func startMirrors(cfg *Config) {
+	if cfg == nil {
+		log.Println("[WARN] Конфигурация зеркал не задана")
+		return
+	}
+
+	var (
+		portMutex   sync.Mutex
+		nextPort    = cfg.StartPort
+		tokensMutex sync.Mutex
+		tokenIndex  int
+	)
+
+	for _, tmpl := range cfg.Servers {
+		tmpl := tmpl
+		for i := uint32(0); i < tmpl.Count; i++ {
 			tokensMutex.Lock()
-			if tokensCount >= len(tokens)-1 {
+			if tokenIndex >= len(tokens) {
 				tokensMutex.Unlock()
-				continue
+				log.Println("[WARN] tokens.txt exhausted")
+				return
 			}
-			token := tokens[tokensCount]
-			tokensCount++
+
+			token := strings.TrimSpace(tokens[tokenIndex])
+			tokenIndex++
 			tokensMutex.Unlock()
 
+			if token == "" {
+				log.Println("[WARN] пустой токен авторизации, зеркало пропущено")
+				continue
+			}
+
 			portMutex.Lock()
-			port := startPort
-			startPort++
+			port := nextPort
+			nextPort++
 			portMutex.Unlock()
 
-			go runMirror(item, token, port, config.CSGOMod)
+			if err := startUDPServer(port, tmpl); err != nil {
+				log.Printf("[WARN] Не удалось запустить UDP сервер на порту %d: %v", port, err)
+			}
+
+			go runMirror(tmpl, token, port, cfg.CSGOMod)
 		}
 	}
 }
@@ -203,6 +285,7 @@ func runMirror(item Servers, token string, port uint32, csgoMod bool) {
 	s.SetBots(item.Bots)
 	s.SetCSGOMod(csgoMod)
 	s.SetTags(item.Tags)
+	s.SetVersion(getGameVersion())
 	s.Connect()
 
 	started := false
@@ -388,119 +471,6 @@ func removePlayer(target *player.Player) {
 			break
 		}
 	}
-}
-
-func runMirror(tmpl Servers, token string, port uint32, csgoMod bool, accountsMutex *sync.Mutex, accountsIdx *int) {
-	srv := server.New()
-	srv.SetHostname(tmpl.Hostname)
-	srv.SetMap(tmpl.Map)
-	srv.SetMaxPlayers(tmpl.MaxPlayers)
-	srv.SetPort(port)
-	srv.SetSecure(tmpl.Secure)
-	srv.SetRegion(tmpl.Region)
-	srv.SetBots(tmpl.Bots)
-	srv.SetCSGOMod(csgoMod)
-	srv.SetTags(tmpl.Tags)
-	srv.SetVersion(getGameVersion())
-
-	srv.Connect()
-
-	for event := range srv.Events() {
-		switch e := event.(type) {
-		case *steam.ConnectedEvent:
-			srv.Logon(token)
-		case *server.LoggedOnEvent:
-			if e.Result == 1 {
-				log.Printf("Зеркало %s запущено на порту %d", tmpl.Hostname, port)
-				mirrorsMutex.Lock()
-				mirrors = append(mirrors, srv)
-				mirrorsMutex.Unlock()
-				startPlayersForServer(srv, tmpl, accountsMutex, accountsIdx)
-				srv.SendTickets()
-			} else {
-				log.Printf("Не удалось авторизовать зеркало %s. Код: %d", tmpl.Hostname, e.Result)
-			}
-		case steam.FatalErrorEvent:
-			log.Printf("[Mirror] %s завершено с ошибкой: %v", tmpl.Hostname, e)
-			return
-		case error:
-			log.Printf("[Mirror] %s ошибка: %v", tmpl.Hostname, e)
-		}
-	}
-}
-
-func startPlayersForServer(srv *server.Server, tmpl Servers, accountsMutex *sync.Mutex, accountsIdx *int) {
-	for i := uint8(0); i < tmpl.Players; i++ {
-		accountsMutex.Lock()
-		if *accountsIdx >= len(accounts) {
-			accountsMutex.Unlock()
-			log.Println("[WARN] accounts.txt exhausted")
-			return
-		}
-
-		accountLine := accounts[*accountsIdx]
-		(*accountsIdx)++
-		accountsMutex.Unlock()
-
-		credentials := strings.SplitN(accountLine, ":", 2)
-		if len(credentials) != 2 {
-			log.Printf("[WARN] некорректные учетные данные: %s", accountLine)
-			continue
-		}
-
-		login := strings.TrimSpace(credentials[0])
-		password := strings.TrimSpace(credentials[1])
-		if login == "" || password == "" {
-			log.Printf("[WARN] пустой логин или пароль: %s", accountLine)
-			continue
-		}
-
-		startPlayer(srv, login, password)
-
-		if tmpl.Bots > 0 || tmpl.UseAbuse {
-			break
-		}
-	}
-}
-
-func startPlayer(srv *server.Server, login, password string) {
-	p := player.New()
-
-	go func() {
-		for event := range p.Events() {
-			switch e := event.(type) {
-			case *steam.ConnectedEvent:
-				p.Logon(login, password)
-			case *player.LoggedOnEvent:
-				if e.Result == 1 {
-					log.Printf("Аккаунт %s авторизован", login)
-					playersMutex.Lock()
-					players = append(players, p)
-					playersMutex.Unlock()
-					p.GetAppOwnershipTicket(730)
-				} else {
-					log.Printf("Не удалось авторизовать аккаунт %s. Код: %d", login, e.Result)
-					return
-				}
-			case *player.AppOwnershipTicketResponse:
-				ticket := e.Ticket
-				if ticket != nil {
-					result, err := p.AuthSessionTicket(ticket)
-					if err == nil {
-						srv.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
-						srv.SendTickets()
-					} else {
-						log.Printf("[Player] ошибка AuthSessionTicket %s: %v", login, err)
-					}
-				}
-			case steam.FatalErrorEvent:
-				log.Printf("[Player] %s завершился с ошибкой: %v", login, e)
-				return
-			case error:
-				log.Printf("[Player] %s ошибка: %v", login, e)
-			}
-		}
-	}()
 }
 
 func heartbeatLoop() {
