@@ -1,6 +1,5 @@
 {
   "start_port": 27016,
-  "csgo_mod": false,
   "servers": [
     {
       "count": 1000,
@@ -13,7 +12,6 @@
       "region": "3",
       "secure": true,
       "tags": "wirstaff_inc",
-      "use_abuse": false,
       "description": "Wirstaff INC"
     }
   ]
