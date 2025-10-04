@@ -5,8 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -57,17 +57,19 @@ var (
 	playersMutex sync.RWMutex
 	players      []*player.Player
 
-var playersForServerMutex sync.RWMutex
-var playersForServer = make(map[*server.Server][]*player.Player)
+	playersForServerMutex sync.RWMutex
+	playersForServer      = make(map[*server.Server][]*player.Player)
 
-var playerAccountsMutex sync.Mutex
-var playerAccounts = make(map[*player.Player]string)
+	playerAccountsMutex sync.Mutex
+	playerAccounts      = make(map[*player.Player]string)
 
-var accounts []string
-var tokens []string
+	accounts      []string
+	tokens        []string
+	accountsMutex sync.Mutex
+	accountsQueue []string
 
-var accountsMutex sync.Mutex
-var accountsQueue []string
+	httpClient = &http.Client{Timeout: 10 * time.Second}
+)
 
 func main() {
 	log.Println("Product ID: mirrors-x-cs2go")
@@ -95,6 +97,10 @@ func main() {
 	accounts = utils.ReadFile(*accountsPath)
 	tokens = utils.ReadFile(*tokensPath)
 
+	accountsMutex.Lock()
+	accountsQueue = append(accountsQueue, accounts...)
+	accountsMutex.Unlock()
+
 	version, err := loadVersion(*versionPath)
 	if err != nil {
 		log.Fatalf("Не удалось загрузить версию игры: %v", err)
@@ -105,7 +111,10 @@ func main() {
 	go heartbeatLoop()
 	go startMirrors(config)
 
-	background()
+	quit := background()
+	sig := <-quit
+	log.Printf("Получен сигнал завершения: %s", sig)
+	signal.Stop(quit)
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -141,19 +150,7 @@ func loadVersion(path string) (string, error) {
 		return "", err
 	}
 
-	accountsMutex.Lock()
-	accountsQueue = append(accountsQueue, accounts...)
-	accountsMutex.Unlock()
-
-	go heartbeatLoop()
-
 	return version, nil
-}
-
-	quit := background()
-	sig := <-quit
-	log.Printf("Получен сигнал завершения: %s", sig)
-	signal.Stop(quit)
 }
 
 func fetchSteamVersion() (string, error) {
@@ -167,27 +164,49 @@ func fetchSteamVersion() (string, error) {
 		return "", fmt.Errorf("steam api returned status %d", resp.StatusCode)
 	}
 
-	tokensCount := 0
-	var tokensMutex sync.Mutex
+	var payload struct {
+		Response struct {
+			RequiredVersion string `json:"required_version"`
+		} `json:"response"`
+	}
 
-	for _, item := range config.Servers {
-		item := item
-		for range item.Count {
-			tokensMutex.Lock()
-			if tokensCount >= len(tokens)-1 {
-				tokensMutex.Unlock()
-				continue
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+
+	version := strings.TrimSpace(payload.Response.RequiredVersion)
+	if version == "" {
+		return "", errors.New("steam returned empty version")
+	}
+
+	return version, nil
+}
+
+func startMirrors(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+
+	rand.Seed(time.Now().UnixNano())
+
+	nextPort := cfg.StartPort
+	tokenIndex := 0
+
+	for _, srv := range cfg.Servers {
+		srv := srv
+		for i := uint32(0); i < srv.Count; i++ {
+			if tokenIndex >= len(tokens) {
+				log.Println("[WARN] tokens.txt exhausted")
+				return
 			}
-			token := tokens[tokensCount]
-			tokensCount++
-			tokensMutex.Unlock()
 
-			portMutex.Lock()
-			port := startPort
-			startPort++
-			portMutex.Unlock()
+			token := strings.TrimSpace(tokens[tokenIndex])
+			tokenIndex++
 
-			go runMirror(item, token, port, config.CSGOMod)
+			go runMirror(srv, token, nextPort, cfg.CSGOMod)
+
+			nextPort++
+			time.Sleep(time.Duration(rand.Intn(90)+10) * time.Microsecond)
 		}
 	}
 }
@@ -263,6 +282,11 @@ func runMirror(item Servers, token string, port uint32, csgoMod bool) {
 	}
 }
 
+type playerLoginConfirmation struct {
+	player  *player.Player
+	success bool
+}
+
 func startPlayersForServer(s *server.Server, item Servers) []*player.Player {
 	startedPlayers := make([]*player.Player, 0, item.Players)
 
@@ -278,57 +302,92 @@ func startPlayersForServer(s *server.Server, item Servers) []*player.Player {
 			continue
 		}
 
-		p := player.New()
-		loggedOn := false
-
-		for event := range p.Events() {
-			switch e := event.(type) {
-			case *steam.ConnectedEvent:
-				p.Logon(credentials[0], credentials[1])
-				continue
-			case *player.LoggedOnEvent:
-				if e.Result == 1 {
-					log.Printf("Аккаунт %s авторизован\n", credentials[0])
-					playersMutex.Lock()
-					players = append(players, p)
-					playersMutex.Unlock()
-
-					playerAccountsMutex.Lock()
-					playerAccounts[p] = account
-					playerAccountsMutex.Unlock()
-
-					startedPlayers = append(startedPlayers, p)
-					loggedOn = true
-
-					p.GetAppOwnershipTicket(730)
-					continue
-				}
-			case *player.AppOwnershipTicketResponse:
-				ticket := e.Ticket
-				if ticket != nil {
-					if result, err := p.AuthSessionTicket(e.Ticket); err == nil {
-						s.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
-					}
-				}
-			case steam.FatalErrorEvent:
-			case error:
-			}
-
-			break
-		}
-
-		if !loggedOn {
-			p.Logoff()
+		login := strings.TrimSpace(credentials[0])
+		password := strings.TrimSpace(credentials[1])
+		if login == "" || password == "" {
 			releaseAccount(account)
 			continue
 		}
 
+		confirmation := make(chan playerLoginConfirmation, 1)
+		startPlayer(s, login, password, confirmation)
+
+		result := <-confirmation
+		if !result.success || result.player == nil {
+			if result.player != nil {
+				result.player.Logoff()
+			}
+			releaseAccount(account)
+			continue
+		}
+
+		playersMutex.Lock()
+		players = append(players, result.player)
+		playersMutex.Unlock()
+
+		playerAccountsMutex.Lock()
+		playerAccounts[result.player] = account
+		playerAccountsMutex.Unlock()
+
+		startedPlayers = append(startedPlayers, result.player)
+
 		if item.Bots > 0 || item.UseAbuse {
 			break
 		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	return startedPlayers
+}
+
+func startPlayer(s *server.Server, login, password string, confirmation chan<- playerLoginConfirmation) {
+	p := player.New()
+
+	go func() {
+		confirmed := false
+		defer func() {
+			if !confirmed {
+				confirmation <- playerLoginConfirmation{player: p, success: false}
+			}
+		}()
+
+		for event := range p.Events() {
+			switch e := event.(type) {
+			case *steam.ConnectedEvent:
+				p.Logon(login, password)
+			case *player.LoggedOnEvent:
+				if e.Result == 1 {
+					log.Printf("Аккаунт %s авторизован", login)
+					if !confirmed {
+						confirmation <- playerLoginConfirmation{player: p, success: true}
+						confirmed = true
+					}
+					p.GetAppOwnershipTicket(730)
+				} else {
+					log.Printf("Не удалось авторизовать аккаунт %s. Код: %d", login, e.Result)
+					return
+				}
+			case *player.AppOwnershipTicketResponse:
+				ticket := e.Ticket
+				if ticket != nil {
+					if result, err := p.AuthSessionTicket(ticket); err == nil {
+						s.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
+					} else {
+						log.Printf("[Player] ошибка AuthSessionTicket %s: %v", login, err)
+					}
+				}
+			case steam.FatalErrorEvent:
+				log.Printf("[Player] %s завершился с ошибкой: %v", login, e)
+				return
+			case error:
+				log.Printf("[Player] %s ошибка: %v", login, e)
+				if !confirmed {
+					return
+				}
+			}
+		}
+	}()
 }
 
 func acquireAccount() (string, bool) {
@@ -388,119 +447,6 @@ func removePlayer(target *player.Player) {
 			break
 		}
 	}
-}
-
-func runMirror(tmpl Servers, token string, port uint32, csgoMod bool, accountsMutex *sync.Mutex, accountsIdx *int) {
-	srv := server.New()
-	srv.SetHostname(tmpl.Hostname)
-	srv.SetMap(tmpl.Map)
-	srv.SetMaxPlayers(tmpl.MaxPlayers)
-	srv.SetPort(port)
-	srv.SetSecure(tmpl.Secure)
-	srv.SetRegion(tmpl.Region)
-	srv.SetBots(tmpl.Bots)
-	srv.SetCSGOMod(csgoMod)
-	srv.SetTags(tmpl.Tags)
-	srv.SetVersion(getGameVersion())
-
-	srv.Connect()
-
-	for event := range srv.Events() {
-		switch e := event.(type) {
-		case *steam.ConnectedEvent:
-			srv.Logon(token)
-		case *server.LoggedOnEvent:
-			if e.Result == 1 {
-				log.Printf("Зеркало %s запущено на порту %d", tmpl.Hostname, port)
-				mirrorsMutex.Lock()
-				mirrors = append(mirrors, srv)
-				mirrorsMutex.Unlock()
-				startPlayersForServer(srv, tmpl, accountsMutex, accountsIdx)
-				srv.SendTickets()
-			} else {
-				log.Printf("Не удалось авторизовать зеркало %s. Код: %d", tmpl.Hostname, e.Result)
-			}
-		case steam.FatalErrorEvent:
-			log.Printf("[Mirror] %s завершено с ошибкой: %v", tmpl.Hostname, e)
-			return
-		case error:
-			log.Printf("[Mirror] %s ошибка: %v", tmpl.Hostname, e)
-		}
-	}
-}
-
-func startPlayersForServer(srv *server.Server, tmpl Servers, accountsMutex *sync.Mutex, accountsIdx *int) {
-	for i := uint8(0); i < tmpl.Players; i++ {
-		accountsMutex.Lock()
-		if *accountsIdx >= len(accounts) {
-			accountsMutex.Unlock()
-			log.Println("[WARN] accounts.txt exhausted")
-			return
-		}
-
-		accountLine := accounts[*accountsIdx]
-		(*accountsIdx)++
-		accountsMutex.Unlock()
-
-		credentials := strings.SplitN(accountLine, ":", 2)
-		if len(credentials) != 2 {
-			log.Printf("[WARN] некорректные учетные данные: %s", accountLine)
-			continue
-		}
-
-		login := strings.TrimSpace(credentials[0])
-		password := strings.TrimSpace(credentials[1])
-		if login == "" || password == "" {
-			log.Printf("[WARN] пустой логин или пароль: %s", accountLine)
-			continue
-		}
-
-		startPlayer(srv, login, password)
-
-		if tmpl.Bots > 0 || tmpl.UseAbuse {
-			break
-		}
-	}
-}
-
-func startPlayer(srv *server.Server, login, password string) {
-	p := player.New()
-
-	go func() {
-		for event := range p.Events() {
-			switch e := event.(type) {
-			case *steam.ConnectedEvent:
-				p.Logon(login, password)
-			case *player.LoggedOnEvent:
-				if e.Result == 1 {
-					log.Printf("Аккаунт %s авторизован", login)
-					playersMutex.Lock()
-					players = append(players, p)
-					playersMutex.Unlock()
-					p.GetAppOwnershipTicket(730)
-				} else {
-					log.Printf("Не удалось авторизовать аккаунт %s. Код: %d", login, e.Result)
-					return
-				}
-			case *player.AppOwnershipTicketResponse:
-				ticket := e.Ticket
-				if ticket != nil {
-					result, err := p.AuthSessionTicket(ticket)
-					if err == nil {
-						srv.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
-						srv.SendTickets()
-					} else {
-						log.Printf("[Player] ошибка AuthSessionTicket %s: %v", login, err)
-					}
-				}
-			case steam.FatalErrorEvent:
-				log.Printf("[Player] %s завершился с ошибкой: %v", login, e)
-				return
-			case error:
-				log.Printf("[Player] %s ошибка: %v", login, e)
-			}
-		}
-	}()
 }
 
 func heartbeatLoop() {
