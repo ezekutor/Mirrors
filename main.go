@@ -44,8 +44,17 @@ var mirrors []*server.Server
 var playersMutex sync.RWMutex
 var players []*player.Player
 
+var playersForServerMutex sync.RWMutex
+var playersForServer = make(map[*server.Server][]*player.Player)
+
+var playerAccountsMutex sync.Mutex
+var playerAccounts = make(map[*player.Player]string)
+
 var accounts []string
 var tokens []string
+
+var accountsMutex sync.Mutex
+var accountsQueue []string
 
 func main() {
 	log.Println("Product ID: mirrors-x-cs2go")
@@ -82,6 +91,10 @@ func main() {
 	accounts = utils.ReadFile(*accountsPath)
 	tokens = utils.ReadFile(*tokensPath)
 
+	accountsMutex.Lock()
+	accountsQueue = append(accountsQueue, accounts...)
+	accountsMutex.Unlock()
+
 	go heartbeatLoop()
 
 	go loadServers(config)
@@ -94,114 +107,224 @@ func loadServers(config *Config) {
 	var portMutex sync.Mutex
 
 	tokensCount := 0
-	accountsCount := 0
 	var tokensMutex sync.Mutex
-	var accountsMutex sync.Mutex
 
 	for _, item := range config.Servers {
+		item := item
 		for range item.Count {
-			if tokensCount < len(tokens)-1 {
-				tokensMutex.Lock()
-				token := tokens[tokensCount]
-				tokensCount++
+			tokensMutex.Lock()
+			if tokensCount >= len(tokens)-1 {
 				tokensMutex.Unlock()
-
-				go func() {
-					s := server.New()
-					s.SetHostname(item.Hostname)
-					s.SetMap(item.Map)
-					s.SetMaxPlayers(item.MaxPlayers)
-					portMutex.Lock()
-					s.SetPort(startPort)
-					port := startPort
-					startPort++
-					portMutex.Unlock()
-					s.SetSecure(item.Secure)
-					s.SetRegion(item.Region)
-					s.SetBots(item.Bots)
-					s.SetCSGOMod(config.CSGOMod)
-					s.SetTags(item.Tags)
-					s.Connect()
-
-					for event := range s.Events() {
-						switch e := event.(type) {
-						case *steam.ConnectedEvent:
-							s.Logon(token)
-							continue
-						case *server.LoggedOnEvent:
-							if e.Result == 1 {
-								log.Printf("Зеркало %s запущено на порту %d\n", item.Hostname, port)
-								mirrorsMutex.Lock()
-								mirrors = append(mirrors, s)
-								mirrorsMutex.Unlock()
-							}
-							break
-						case steam.FatalErrorEvent:
-							break
-						case error:
-							break
-						}
-
-						break
-					}
-
-					for range item.Players {
-						accountsMutex.Lock()
-						if accountsCount < len(accounts)-1 && item.Players > 0 {
-							p := player.New()
-
-							credentials := strings.Split(accounts[accountsCount], ":")
-
-							for event := range p.Events() {
-								switch e := event.(type) {
-								case *steam.ConnectedEvent:
-									p.Logon(credentials[0], credentials[1])
-									accountsCount++
-									continue
-								case *player.LoggedOnEvent:
-									if e.Result == 1 {
-										log.Printf("Аккаунт %s авторизован\n", credentials[0])
-										playersMutex.Lock()
-										players = append(players, p)
-										playersMutex.Unlock()
-
-										p.GetAppOwnershipTicket(730)
-
-										continue
-									}
-
-									break
-								case *player.AppOwnershipTicketResponse:
-									ticket := e.Ticket
-									if ticket != nil {
-										result, err := p.AuthSessionTicket(e.Ticket)
-
-										if err == nil {
-											s.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
-										}
-									}
-									break
-								case steam.FatalErrorEvent:
-									break
-								case error:
-									break
-								}
-
-								break
-							}
-
-							if item.Bots > 0 || item.UseAbuse {
-								break
-							}
-						}
-
-						accountsMutex.Unlock()
-					}
-
-					fmt.Println("Send Tickets")
-					s.SendTickets()
-				}()
+				continue
 			}
+			token := tokens[tokensCount]
+			tokensCount++
+			tokensMutex.Unlock()
+
+			portMutex.Lock()
+			port := startPort
+			startPort++
+			portMutex.Unlock()
+
+			go runMirror(item, token, port, config.CSGOMod)
+		}
+	}
+}
+
+func runMirror(item Servers, token string, port uint32, csgoMod bool) {
+	s := server.New()
+	s.SetHostname(item.Hostname)
+	s.SetMap(item.Map)
+	s.SetMaxPlayers(item.MaxPlayers)
+	s.SetPort(port)
+	s.SetSecure(item.Secure)
+	s.SetRegion(item.Region)
+	s.SetBots(item.Bots)
+	s.SetCSGOMod(csgoMod)
+	s.SetTags(item.Tags)
+	s.Connect()
+
+	started := false
+
+	for event := range s.Events() {
+		switch e := event.(type) {
+		case *steam.ConnectedEvent:
+			s.Logon(token)
+			continue
+		case *server.LoggedOnEvent:
+			if e.Result == 1 {
+				log.Printf("Зеркало %s запущено на порту %d\n", item.Hostname, port)
+				mirrorsMutex.Lock()
+				mirrors = append(mirrors, s)
+				mirrorsMutex.Unlock()
+				started = true
+			}
+		case steam.FatalErrorEvent:
+		case error:
+		}
+
+		break
+	}
+
+	if !started {
+		return
+	}
+
+	playersList := startPlayersForServer(s, item)
+
+	playersForServerMutex.Lock()
+	playersForServer[s] = append([]*player.Player(nil), playersList...)
+	playersForServerMutex.Unlock()
+
+	fmt.Println("Send Tickets")
+	s.SendTickets()
+
+	ticker := time.NewTicker(6 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		playersForServerMutex.Lock()
+		currentPlayers := playersForServer[s]
+		delete(playersForServer, s)
+		playersForServerMutex.Unlock()
+
+		for _, p := range currentPlayers {
+			cleanupPlayer(p)
+		}
+
+		newPlayers := startPlayersForServer(s, item)
+
+		playersForServerMutex.Lock()
+		playersForServer[s] = append([]*player.Player(nil), newPlayers...)
+		playersForServerMutex.Unlock()
+
+		s.SendTickets()
+	}
+}
+
+func startPlayersForServer(s *server.Server, item Servers) []*player.Player {
+	startedPlayers := make([]*player.Player, 0, item.Players)
+
+	for i := uint8(0); i < item.Players; i++ {
+		account, ok := acquireAccount()
+		if !ok {
+			break
+		}
+
+		credentials := strings.SplitN(account, ":", 2)
+		if len(credentials) != 2 {
+			releaseAccount(account)
+			continue
+		}
+
+		p := player.New()
+		loggedOn := false
+
+		for event := range p.Events() {
+			switch e := event.(type) {
+			case *steam.ConnectedEvent:
+				p.Logon(credentials[0], credentials[1])
+				continue
+			case *player.LoggedOnEvent:
+				if e.Result == 1 {
+					log.Printf("Аккаунт %s авторизован\n", credentials[0])
+					playersMutex.Lock()
+					players = append(players, p)
+					playersMutex.Unlock()
+
+					playerAccountsMutex.Lock()
+					playerAccounts[p] = account
+					playerAccountsMutex.Unlock()
+
+					startedPlayers = append(startedPlayers, p)
+					loggedOn = true
+
+					p.GetAppOwnershipTicket(730)
+					continue
+				}
+			case *player.AppOwnershipTicketResponse:
+				ticket := e.Ticket
+				if ticket != nil {
+					if result, err := p.AuthSessionTicket(e.Ticket); err == nil {
+						s.AddFakeClient(result.SteamId, result.Ticket, result.Crc)
+					}
+				}
+			case steam.FatalErrorEvent:
+			case error:
+			}
+
+			break
+		}
+
+		if !loggedOn {
+			p.Logoff()
+			releaseAccount(account)
+			continue
+		}
+
+		if item.Bots > 0 || item.UseAbuse {
+			break
+		}
+	}
+
+	return startedPlayers
+}
+
+func acquireAccount() (string, bool) {
+	accountsMutex.Lock()
+	defer accountsMutex.Unlock()
+
+	if len(accountsQueue) == 0 {
+		return "", false
+	}
+
+	account := accountsQueue[0]
+	accountsQueue = accountsQueue[1:]
+
+	return account, true
+}
+
+func releaseAccount(account string) {
+	if account == "" {
+		return
+	}
+
+	accountsMutex.Lock()
+	accountsQueue = append(accountsQueue, account)
+	accountsMutex.Unlock()
+}
+
+func cleanupPlayer(p *player.Player) {
+	if p == nil {
+		return
+	}
+
+	p.Logoff()
+	releaseAccountForPlayer(p)
+	removePlayer(p)
+}
+
+func releaseAccountForPlayer(p *player.Player) {
+	playerAccountsMutex.Lock()
+	account, ok := playerAccounts[p]
+	if ok {
+		delete(playerAccounts, p)
+	}
+	playerAccountsMutex.Unlock()
+
+	if ok {
+		releaseAccount(account)
+	}
+}
+
+func removePlayer(target *player.Player) {
+	playersMutex.Lock()
+	defer playersMutex.Unlock()
+
+	for i, p := range players {
+		if p == target {
+			players = append(players[:i], players[i+1:]...)
+			break
 		}
 	}
 }

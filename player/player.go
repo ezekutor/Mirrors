@@ -228,3 +228,8 @@ func (p *Player) NormalizeTickets() {
 func (p *Player) HeartBeat() {
 	p.client.Write(protocol.NewClientMsgProtobuf(steamlang.EMsg_ClientHeartBeat, new(protobuf.CMsgClientHeartBeat)))
 }
+
+func (p *Player) Logoff() {
+	p.client.Write(protocol.NewClientMsgProtobuf(steamlang.EMsg_ClientLogOff, new(protobuf.CMsgClientLogOff)))
+	p.client.Disconnect()
+}
